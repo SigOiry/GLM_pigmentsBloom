@@ -1,0 +1,73 @@
+---
+title: "GLM_IndicesPigments"
+author: "Simon Oiry"
+format: html
+editor: source
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r library}
+library(tidyverse)
+library(readxl)
+library(brms)
+```
+
+```{r data opening and formating}
+
+sheets <- readxl::excel_sheets("Data/indices_Datas.xlsx") %>% 
+  as_tibble() %>% 
+  rename(sheet = "value") %>% 
+  mutate(pigment = case_when(str_detect(tolower(sheet),"lepi") ~ "Chlb",
+                             str_detect(tolower(sheet),"dino") ~ "Chlc",
+                             str_detect(tolower(sheet),"cyano") ~ "PC"),
+         sensor = c("PRISMA","PACE","PRISMA","PRISMA","PRISMA","EMIT","EMIT","PRISMA","PRISMA","PRISMA"))
+
+df_n <- NA
+for(i in 1:nrow(sheets)){
+  
+  df <- readxl::read_xlsx("Data/indices_Datas.xlsx", sheet = sheets$sheet[i]) %>% 
+    dplyr::select(-c(Chlb,Chlc,PC)) %>% 
+    mutate(Pigment = sheets$pigment[i],
+           Sensor = sheets$sensor[i],
+           Image = sheets$sheet[i])
+  
+  if(i == 1 ){
+    df_all <- df
+  }else{
+    df_all <- rbind(df_all,df)
+  }
+ df_n <- c(df_n,nrow(df))
+ 
+}
+
+```
+
+```{r modelling}
+
+options(brms.backend = "rstan")
+
+df_brms <- df_all %>%
+  mutate(Pigment = as.factor(Pigment),
+         Image = as.factor(Image),
+         Sensor = as.factor(Sensor)) %>%
+  filter((Pigment == "PC" & Chla > 20) | (Pigment != "PC" & Chla > 30))
+
+
+model <- brm(
+  formula = bf(Pigment ~ (Chla * LH646 * LH628 * LH620) + 
+                     (1 | Image) + 
+                     (1 | Sensor)),
+  data = df_brms,
+  family = categorical(link = "logit"),
+  cores = 4,
+  warmup = 50,
+  iter = 200,
+  file = "models/GLM_200iter_Pigm_vs_InteractionOfIndex_ImageAndSensorAsRandom"
+)
+
+
+```
+
+
+
