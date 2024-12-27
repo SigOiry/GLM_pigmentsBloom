@@ -51,19 +51,28 @@ df_brms <- df_all %>%
   mutate(Pigment = as.factor(Pigment),
          Image = as.factor(Image),
          Sensor = as.factor(Sensor)) %>%
-  filter((Pigment == "PC" & Chla > 20) | (Pigment != "PC" & Chla > 30))
+  dplyr::filter(Sensor != "PACE",
+         Chla > 20,
+         LH620<0.5) %>% 
+  dplyr::select(-c(Chla,Image))
 
+
+df_brms %>% 
+  pivot_longer(-c(Pigment, Sensor), names_to = "variable", values_to = "values") %>% 
+  ggplot(aes(x = Sensor, y = values))+
+  geom_boxplot()+
+  facet_wrap(~ variable, scales = "free")
 
 model <- brm(
-  formula = bf(Pigment ~ (Chla * LH646 * LH628 * LH620) + 
-                     (1 | Image) + 
+  formula = bf(Pigment ~ (LH646 * LH628 * LH620) + 
+                     # (1 | Image) + 
                      (1 | Sensor)),
   data = df_brms,
   family = categorical(link = "logit"),
   cores = 8,
-  warmup = 200,
-  iter = 2000,
-  file = "models/GLM_2000iter_Pigm_vs_InteractionOfIndex_ImageAndSensorAsRandom"
+  warmup = 50,
+  iter = 500,
+  file = "models/GLM_500iter_Pigm_vs_InteractionOfIndex_SensorAsRandom_WithoutChla"
 )
 
 plot(model)
