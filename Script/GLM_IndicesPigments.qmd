@@ -60,13 +60,15 @@ model <- brm(
                      (1 | Sensor)),
   data = df_brms,
   family = categorical(link = "logit"),
-  cores = 4,
-  warmup = 50,
-  iter = 200,
-  file = "models/GLM_200iter_Pigm_vs_InteractionOfIndex_ImageAndSensorAsRandom"
+  cores = 8,
+  warmup = 200,
+  iter = 2000,
+  file = "models/GLM_2000iter_Pigm_vs_InteractionOfIndex_ImageAndSensorAsRandom"
 )
 
+plot(model)
 
+summary(model)
 ```
 
 
