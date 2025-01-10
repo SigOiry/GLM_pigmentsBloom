@@ -11,6 +11,7 @@ editor_options:
 library(tidyverse)
 library(readxl)
 library(brms)
+library(tidybayes)
 ```
 
 ```{r data opening and formating}
@@ -54,30 +55,243 @@ df_brms <- df_all %>%
   dplyr::filter(Sensor != "PACE",
          Chla > 20,
          LH620<0.5) %>% 
-  dplyr::select(-c(Chla,Image))
+  dplyr::select(-c(Chla,Image,Sensor))
 
 
-df_brms %>% 
-  pivot_longer(-c(Pigment, Sensor), names_to = "variable", values_to = "values") %>% 
-  ggplot(aes(x = Sensor, y = values))+
-  geom_boxplot()+
-  facet_wrap(~ variable, scales = "free")
+numeric_vars <- df_brms[, c("LH646", "LH628", "LH620")]
 
-model <- brm(
-  formula = bf(Pigment ~ (LH646 * LH628 * LH620) + 
-                     # (1 | Image) + 
-                     (1 | Sensor)),
+# Compute correlation matrix
+cor_mat <- cor(numeric_vars, use = "complete.obs")
+
+# View it
+cor_mat
+
+
+
+# 1. Define shrinkage priors:
+#    - Normal(0, 1) for all fixed effects (class = "b")
+#    - Normal(0, 5) for the Intercept (slightly looser)
+#    - Student_t(3, 0, 2.5) for random-effect SD (optional choice)
+shrinkage_priors <- c(
+  # Category 2
+  prior(normal(0, 1), class = "b",        dpar = "muChlc"),
+  prior(normal(0, 5), class = "Intercept", dpar = "muChlc"),
+
+  # Category 3
+  prior(normal(0, 1), class = "b",        dpar = "muPC"),
+  prior(normal(0, 5), class = "Intercept", dpar = "muPC")
+
+  # If you had more categories (mu4, mu5, ...),
+  # add them similarly.
+)
+get_prior(Pigment ~ LH646 + LH628 * LH620, data = df_brms,  family = categorical())
+
+model_prior_check <- brm(
+  formula = Pigment ~ LH646 + LH628 * LH620,
   data = df_brms,
-  family = categorical(link = "logit"),
-  cores = 8,
-  warmup = 50,
-  iter = 500,
-  file = "models/GLM_500iter_Pigm_vs_InteractionOfIndex_SensorAsRandom_WithoutChla"
+  family = categorical(),
+  prior = shrinkage_priors,
+  sample_prior = "only",  # sample from the prior only!
+  chains = 2, iter = 1000
 )
 
-plot(model)
 
-summary(model)
+# Then look at the generated predictions
+# pp_check(model_prior_check, type = "bars_grouped", resp = "Pigment")
+
+# 2. Refit the model using scaled predictors and shrinkage priors
+model_shrink <- brm(
+  formula = bf(Pigment ~ (LH646 + LH628 * LH620)),
+  data = df_brms,
+  family = categorical(link = "logit"),
+  prior = shrinkage_priors,        # <--- Apply your shrinkage priors here
+  cores = 8,
+  warmup = 100,    # Consider increasing this for better convergence
+  iter = 1000,     # (Likewise, you might want more total iterations)
+  file = "models/GLM_1000iter_Pigm_vs_Shrinkage"
+)
+
+# 3. Check results
+summary(model_shrink)
+
+plot(model_shrink)
+```
+
+```{r Result plotting}
+
+library(Utilities.Package)
+
+new_data <- data.frame(LH646 = seq(min(df_brms$LH646), max(df_brms$LH646), length.out = 1000),
+                        LH628 = seq(min(df_brms$LH628), max(df_brms$LH628), length.out = 1000),
+                        LH620 = seq(min(df_brms$LH620), max(df_brms$LH620), length.out = 1000))
+
+fit <- add_epred_draws(new_data, model_shrink)
+
+df_fit <- fit %>%
+  group_by(LH646,LH628,LH620, .category) %>% 
+  reframe(median_qi(.epred)) 
+
+df_fit %>% 
+  pivot_longer(c(LH646,  LH628,  LH620), names_to = "LH",values_to = "values") %>%
+  # dplyr::filter(.category == "Chlb") %>% 
+  ggplot(aes(x = values, y = y, color = .category, group = .category))+
+  geom_line()+
+  facet_wrap(~LH)
+
+```
+
+
+```{r img processing}
+library(terra)
+library(sf)
+
+filepath <- rstudioapi::selectDirectory()
+
+
+imglist <- list.files(filepath, pattern = ".tif", full.names = T) %>% 
+  as_tibble() %>% 
+  rename(path = "value") %>% 
+  mutate(imgname = gsub(".*/","",path), 
+         date = substr(imgname,8,15), 
+         outputname = gsub(".tif","_pred.tif",imgname))
+
+shp <- list.files(filepath, pattern = ".shp", full.names = T) %>% 
+  as_tibble() %>% 
+  rename(path_shp = "value") %>% 
+  mutate(shp_name = gsub(".*/","",path_shp), 
+         date = substr(shp_name,1,8))
+
+filelist <- imglist %>% 
+  left_join(shp, by ="date")
+
+
+for(i in 2:nrow(filelist)){
+  print(i)
+  
+  shp <- read_sf(filelist$path_shp[i])
+  img <- rast(filelist$path[i]) %>% 
+    crop(shp)
+
+  mask <- as.polygons(img[[45]] < 0 ) %>% 
+    st_as_sf()
+  
+  names(mask) <- c("value","geometry")
+  
+  mask <- mask %>% 
+     dplyr::filter(value == 0)
+    
+  
+  img_water <- img %>% 
+     crop(mask, mask = T)
+  
+  df_img <- img_water %>% 
+    as.data.frame(xy = T) %>% 
+    mutate(ID = 1:nrow(.))
+  
+  
+  df_prediction <- df_img %>% 
+    dplyr::select(x,y,ID, 44,45,46) %>% 
+    as_tibble()
+  
+  names(df_prediction) <- c("x","y","ID","LH646","LH628","LH620")
+  
+  probabilities <- fitted(
+    model_shrink,         # your brms model
+    newdata = df_prediction,     # the new data with 3 columns
+    summary = TRUE       # returns mean and lower/upper intervals
+  )
+  
+  xy <- df_prediction %>% 
+    dplyr::select(x,y)
+  
+Chlb <- as_tibble(probabilities[,,1]) %>% 
+  bind_cols(xy) %>%
+  select(x,y, Estimate) %>% 
+  rast(type = "xyz")
+
+crs(Chlb) <- "EPSG:4326"
+
+Chlc <- as_tibble(probabilities[,,2])%>% 
+  bind_cols(xy) %>%
+  select(x,y, Estimate) %>% 
+  rast(type = "xyz")
+
+crs(Chlc) <- "EPSG:4326"
+
+PC <- as_tibble(probabilities[,,3]) %>% 
+  bind_cols(xy) %>%
+  select(x,y, Estimate) %>% 
+  rast(type = "xyz")
+
+crs(PC) <- "EPSG:4326"
+
+
+writeCDF(Chlc, paste0(filepath,"/output/NC/",gsub(".tif","_Chlc.nc",filelist$outputname[i])), overwrite = T)  
+writeCDF(Chlb, paste0(filepath,"/output/NC/",gsub(".tif","_Chlb.nc",filelist$outputname[i])), overwrite = T)  
+writeCDF(PC, paste0(filepath,"/output/NC/",gsub(".tif","_PC.nc",filelist$outputname[i])), overwrite = T)  
+
+writeRaster(Chlc, paste0(filepath,"/output/tif/",gsub(".tif","_Chlc.tif",filelist$outputname[i])), overwrite = T)  
+writeRaster(Chlb, paste0(filepath,"/output/tif/",gsub(".tif","_Chlb.tif",filelist$outputname[i])), overwrite = T)  
+writeRaster(PC, paste0(filepath,"/output/tif/",gsub(".tif","_PC.tif",filelist$outputname[i])), overwrite = T)  
+  
+}
+
+
+  
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+
+library(Utilities.Package)
+
+df_fitted <- fitted(model_shrink, summary = TRUE)
+
+df_to_join <- df_brms %>% 
+  dplyr::select(-Pigment)
+
+chlb <- as.data.frame(df_fitted[,,1]) %>% 
+  bind_cols(df_to_join) %>% 
+  mutate(Pigment = "Chlb")
+
+chlc <- as.data.frame(df_fitted[,,2]) %>% 
+  bind_cols(df_to_join) %>% 
+  mutate(Pigment = "Chlc")
+
+PC <- as.data.frame(df_fitted[,,3]) %>% 
+  bind_cols(df_to_join) %>% 
+  mutate(Pigment = "PC")
+
+
+df_all_fitted <- chlb %>% 
+  bind_rows(chlc) %>% 
+  bind_rows(PC) %>% 
+  as_tibble() %>% 
+  group_by(Pigment) %>% 
+  slice_sample(n = 10000) %>% 
+  pivot_longer(c(LH646,LH628,LH620), names_to = "Metrics", values_to = "Values")
+
+
+df_all_fitted %>% 
+  ggplot()+
+  geom_line(aes(x = Values, y = Estimate, color = Pigment, group = Pigment))+
+  geom_ribbon(aes(x = Values, y = Estimate, ymin = Estimate-Est.Error, ymax = Estimate+Est.Error, color = Pigment, fill = Pigment, group = Pigment), alpha = 0.2)+
+  facet_wrap(~Metrics)+
+  theme_Bede()
+
 ```
 
 
